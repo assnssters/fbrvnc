@@ -1,0 +1,137 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "fbrvnc release tag (e.g. v0.2.4)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: fbrvnc
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Windows: static CRT, no external linker, no VC++ redist ----
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - name: windows-arm64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            ext: .exe
+
+          # ---- Linux: fully static musl, runs on any libc ----
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            ext: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl-tools provides musl-gcc, required by the Rust musl target
+      # for linking (even for pure-Rust crates) on both x86_64 and aarch64.
+      - name: Install musl toolchain (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # Sanity check: show which musl compilers are available
+          which musl-gcc || true
+
+      - name: Build
+        shell: bash
+        env:
+          # Windows: static CRT (no VC++ redist dependency)
+          # Linux  : static musl (no glibc dependency, single-file binary)
+          RUSTFLAGS: >-
+            ${{
+              runner.os == 'Windows' && '-C target-feature=+crt-static' ||
+              runner.os == 'Linux'   && '-C target-feature=+crt-static' ||
+              ''
+            }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify static (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          BIN=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name' \
+            | tr -d '\r' | head -n1)
+          file "target/${{ matrix.target }}/release/${BIN}"
+          # Fail loudly if the binary is NOT statically linked
+          if file "target/${{ matrix.target }}/release/${BIN}" | grep -q "statically linked"; then
+            echo "OK: static binary"
+          else
+            echo "ERROR: binary is not statically linked"
+            exit 1
+          fi
+
+      - name: Collect binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          bin=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name' \
+            | tr -d '\r' | head -n1)
+          cp "target/${{ matrix.target }}/release/${bin}${{ matrix.ext }}" \
+             "dist/${APP_NAME}-${{ matrix.name }}${{ matrix.ext }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "${{ inputs.tag }}" \
+            --generate-notes
