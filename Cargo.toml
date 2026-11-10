@@ -1,0 +1,13 @@
+[package]
+name    = "fbrvnc"
+version = "0.2.4"
+edition = "2021"
+
+[[bin]]
+name = "fbrvnc"
+path = "src/main.rs"
+
+[dependencies]
+des     = "0.8"
+futures = "0.3"
+tokio   = { version = "1", features = ["full"] }
