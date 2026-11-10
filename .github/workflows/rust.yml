@@ -56,14 +56,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # musl-tools provides musl-gcc, required by the Rust musl target
-      # for linking (even for pure-Rust crates) on both x86_64 and aarch64.
+      # musl-tools provides musl-gcc, required to link the musl target.
       - name: Install musl toolchain (linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          # Sanity check: show which musl compilers are available
           which musl-gcc || true
 
       - name: Build
@@ -86,14 +84,27 @@ jobs:
           BIN=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name' \
             | tr -d '\r' | head -n1)
-          file "target/${{ matrix.target }}/release/${BIN}"
-          # Fail loudly if the binary is NOT statically linked
-          if file "target/${{ matrix.target }}/release/${BIN}" | grep -q "statically linked"; then
-            echo "OK: static binary"
-          else
-            echo "ERROR: binary is not statically linked"
+          BIN="target/${{ matrix.target }}/release/${BIN}"
+
+          echo "--- file ---"
+          file "$BIN"
+
+          # 1) file must report a static variant
+          #    ("statically linked" OR "static-pie linked")
+          if ! file "$BIN" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "ERROR: not a static binary"
             exit 1
           fi
+
+          # 2) readelf: a truly static binary has no (NEEDED) entries.
+          #    This is the authoritative check, valid for both PIE and non-PIE.
+          if readelf -d "$BIN" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "ERROR: binary depends on shared libraries:"
+            readelf -d "$BIN" | grep '(NEEDED)' || true
+            exit 1
+          fi
+
+          echo "OK: fully static binary (no shared library dependencies)"
 
       - name: Collect binary
         shell: bash
