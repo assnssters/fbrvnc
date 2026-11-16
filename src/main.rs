@@ -29,11 +29,12 @@ const DEFAULT_PORT:         u16  = 5900;
 
 const DEFAULT_PASSWORDS: &[&str] = &["123456", "1234", "abc", "admin"];
 
-const DASH_W: i16 = 100;
-const DASH_H: i16 = 42;
-const RECENT_HITS_LIMIT: usize = 20;
-const PARTIAL_TICK_MS:   u64   = 300;  // 0.3s — realtime
-const FULL_TICK_SECS:    u64   = 6;    // 6s   — dọn rác / sửa dashboard
+// Dashboard width ≈ 55% (khớp với đường "=" user yêu cầu)
+const DASH_W: i16 = 55;
+const DASH_H: i16 = 30;
+const RECENT_HITS_LIMIT: usize = 12;
+const PARTIAL_TICK_MS:   u64   = 300;   // 0.3s — realtime
+const FULL_TICK_SECS:    u64   = 6;     // 6s   — dọn rác / sửa dashboard
 
 // ============================================================================
 // Console abstraction (no ANSI on Windows – works on Server 2012 / older)
@@ -225,7 +226,7 @@ fn load_servers(path: &Path, default_port: u16) -> io::Result<Vec<Server>> {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() == 2 && is_ip(parts[0]) {
                 if let Ok(port) = parts[1].parse::<u16>() {
-                    // <-- ip:0 => default port
+                    // ip:0 => default port
                     let port = if port == 0 { default_port } else { port };
                     out.push(Server { ip: parts[0].into(), port });
                 }
@@ -422,7 +423,15 @@ fn pad_to(s: &str, w: usize) -> String {
     }
 }
 
-// Build 15 dòng dashboard, mỗi dòng pad DASH_W
+fn two_col(a: &str, b: &str) -> String {
+    let w = DASH_W as usize;
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
+    let gap = w.saturating_sub(1 + a_len + b_len).max(1);
+    format!(" {}{}{}", a, " ".repeat(gap), b)
+}
+
+// 10 dòng dashboard, mỗi dòng pad DASH_W
 fn dashboard_lines(s: &StateInner, cfg: &Config) -> Vec<String> {
     let w = DASH_W as usize;
     let elapsed = s.elapsed();
@@ -458,10 +467,20 @@ fn dashboard_lines(s: &StateInner, cfg: &Config) -> Vec<String> {
     let sep  = "=".repeat(w);
     let dash = "-".repeat(w);
 
-    let mut v = Vec::with_capacity(15);
+    // ---- từ Attempts trở xuống: 2 cột / dòng ----
+    let l_att   = format!("Attempts  : {}", s.attempts);
+    let r_speed = format!("Speed     : {:.1}/s", speed);
+    let l_el    = format!("Elapsed   : {}", fmt_duration(secs));
+    let r_eta   = format!("ETA       : {}", fmt_duration(eta_secs));
+    let l_th    = format!("Threads   : {}", cfg.threads);
+    let r_to    = format!("Timeout   : {:.1}s", cfg.timeout);
+    let l_res   = format!("Results   : {}", cfg.results_file);
+
+    let mut v = Vec::with_capacity(12);
     v.push(sep.clone());
     v.push(pad_to(&format!(" fbrvnc {} - VNC Brute", VERSION), w));
     v.push(sep);
+    // ---- phần trên: 1 dòng 1 mục ----
     v.push(pad_to(&format!(" Status     : {}",
         if s.finished { "FINISHED" } else { "RUNNING" }), w));
     v.push(pad_to(&format!(" Servers    : {} total, {} cracked, {} remaining",
@@ -469,18 +488,16 @@ fn dashboard_lines(s: &StateInner, cfg: &Config) -> Vec<String> {
     v.push(pad_to(&format!(" Password   : \"{}\"  [{}/{}]",
         s.current_pw, pw_disp, s.password_count), w));
     v.push(pad_to(&format!(" Progress   : [{}] {:.2}%", bar, progress_pct), w));
-    v.push(pad_to(&format!(" Attempts   : {}", s.attempts), w));
-    v.push(pad_to(&format!(" Speed      : {:.1} attempts/s", speed), w));
-    v.push(pad_to(&format!(" Elapsed    : {}", fmt_duration(secs)), w));
-    v.push(pad_to(&format!(" ETA        : {}", fmt_duration(eta_secs)), w));
-    v.push(pad_to(&format!(" Threads    : {}", cfg.threads), w));
-    v.push(pad_to(&format!(" Timeout    : {:.1}s", cfg.timeout), w));
-    v.push(pad_to(&format!(" Results    : {}", cfg.results_file), w));
+    // ---- từ Attempts trở xuống: 2 cột / dòng ----
+    v.push(pad_to(&two_col(&l_att, &r_speed), w));
+    v.push(pad_to(&two_col(&l_el,  &r_eta),   w));
+    v.push(pad_to(&two_col(&l_th,  &r_to),    w));
+    v.push(pad_to(&l_res, w));
     v.push(dash);
     v
 }
 
-// 20 hits gần nhất (mới nhất ở dưới cùng) + dòng đóng
+// 12 hits gần nhất (mới nhất ở dưới) + dòng đóng
 fn hits_lines(s: &StateInner) -> Vec<String> {
     let w = DASH_W as usize;
     let mut v = Vec::with_capacity(RECENT_HITS_LIMIT + 1);
@@ -554,7 +571,7 @@ async fn render_loop(
             render_full(&st, &cfg);
             last_full = Instant::now();
         } else {
-            render_partial(&st, &cfg); // realtime cả dashboard + 20 hits
+            render_partial(&st, &cfg);
         }
 
         if is_shutdown { break; }
@@ -576,7 +593,6 @@ async fn run_brute(
     let timeout       = Duration::from_secs_f64(cfg.timeout);
     let workers       = cfg.threads.max(1);
 
-    // init state BEFORE spawning render loop
     {
         let mut s = shared.inner.lock().unwrap();
         s.total_servers     = total_servers;
@@ -612,7 +628,6 @@ async fn run_brute(
                 async move {
                     let res = rfb_attempt(&srv.ip, srv.port, &cipher, timeout).await;
 
-                    // count every attempt
                     {
                         let mut s = shared.inner.lock().unwrap();
                         s.attempts = s.attempts.wrapping_add(1);
@@ -640,7 +655,6 @@ async fn run_brute(
             .await;
     }
 
-    // finished
     {
         let mut s = shared.inner.lock().unwrap();
         s.finished = true;
@@ -691,7 +705,6 @@ fn main() {
         None => (default_passwords(), "built-in default".to_string()),
     };
 
-    // Console prep
     con::set_title(&format!("fbrvnc {} - VNC Brute", VERSION));
     con::resize(DASH_W, DASH_H);
 
@@ -722,7 +735,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // leave the finished dashboard on screen
     println!();
     println!("Press Enter to exit...");
     let mut _buf = String::new();
